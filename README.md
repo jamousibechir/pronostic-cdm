@@ -121,10 +121,11 @@ La variance sur cette prédiction est structurellement élevée (voir `avg_goals
 |---|---|---|---|
 | Ratings Elo | eloratings.net | GET TSV public | Continue |
 | Classement FIFA | fifa.com | Scrape HTML/JSON | Mensuelle |
-| Résultats historiques | github.com/martj42/international-results | CSV GitHub raw | Mensuelle |
-| Buts par joueur | idem (goalscorers.csv) | CSV GitHub raw | Mensuelle |
-| Fixtures + résultats live | football-data.org v4 | REST API (clé gratuite) | Quotidienne |
-| Stats joueurs caps | FBref.com (StatsBomb) | Scrape HTML | Hebdomadaire |
+| WC 1930–2022 | github.com/jfjelstul/worldcup | CSV GitHub raw (964 matchs) | Définitif |
+| EC 2024 | football-data.org v4 | REST API (clé gratuite) | Définitif |
+| Qualif WC, Nations League, AFCON, Asian Cup, Gold Cup | ESPN API non officielle | JSON scrape (sans clé) | Quotidienne |
+| Fixtures + résultats live WC 2026 | football-data.org v4 | REST API (clé gratuite) | Quotidienne |
+| Stats joueurs caps + buts | FBref.com (StatsBomb) | Scrape HTML | Hebdomadaire |
 
 ---
 

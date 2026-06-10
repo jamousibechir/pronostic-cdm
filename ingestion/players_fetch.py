@@ -37,9 +37,16 @@ FBREF_DELAY = 2.5  # secondes
 def _build_from_goalscorers(wc_teams: list[str]) -> pd.DataFrame:
     """
     Calcule les statistiques de buts par joueur à partir de goalscorers.csv.
-    wc_teams : liste des équipes qualifiées pour WC 2026.
+    Si le fichier est vide (source martj42 indisponible), retourne un DataFrame vide
+    et l'enrichissement FBref prendra le relais.
     """
     gs = fetch_goalscorers()
+
+    if gs.empty:
+        return pd.DataFrame(columns=[
+            "player", "team", "goals_total", "goals_recent",
+            "caps_recent", "goal_rate", "pen_goals", "is_pen_taker", "start_prob"
+        ])
 
     # Filtre : exclut les csc, garde seulement les équipes qualifiées
     gs = gs[~gs["own_goal"]]
@@ -48,14 +55,12 @@ def _build_from_goalscorers(wc_teams: list[str]) -> pd.DataFrame:
 
     gs_recent = gs[gs["date"] >= RECENT_CUTOFF]
 
-    # Stats globales (toute l'histoire disponible dans le CSV)
     total = (
         gs.groupby(["team", "scorer"])
         .size()
         .reset_index(name="goals_total")
     )
 
-    # Stats récentes (depuis 2022)
     recent = (
         gs_recent.groupby(["team", "scorer"])
         .agg(goals_recent=("scorer", "count"),
@@ -63,7 +68,6 @@ def _build_from_goalscorers(wc_teams: list[str]) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Nombre de sélections récentes — proxy via le nombre de matchs distincts
     caps = (
         gs_recent.groupby(["team", "scorer"])["date"]
         .nunique()
@@ -78,9 +82,8 @@ def _build_from_goalscorers(wc_teams: list[str]) -> pd.DataFrame:
     df["goal_rate"]    = df["goals_recent"] / df["caps_recent"].clip(lower=1)
     df["is_pen_taker"] = (df["pen_goals"] >= 2).astype(int)
 
-    # Probabilité de démarrer ≈ 0.85 si nombreuses sélections récentes
     df["start_prob"] = (df["caps_recent"] / df["caps_recent"].max()).clip(upper=1.0)
-    df["start_prob"] = 0.5 + 0.35 * df["start_prob"]   # range [0.5, 0.85]
+    df["start_prob"] = 0.5 + 0.35 * df["start_prob"]
 
     return df[["player", "team", "goals_total", "goals_recent",
                "caps_recent", "goal_rate", "pen_goals",
@@ -185,6 +188,50 @@ def _enrich_with_fbref(df: pd.DataFrame,
 
 # ── Point d'entrée ────────────────────────────────────────────────────────────
 
+def _build_from_fbref_only(wc_teams: list[str]) -> pd.DataFrame:
+    """
+    Construit la table joueurs entièrement depuis FBref quand goalscorers.csv
+    est indisponible. Scrape toutes les équipes connues dans FBREF_TEAM_IDS.
+    """
+    frames = []
+    teams_to_scrape = [t for t in wc_teams if t in FBREF_TEAM_IDS]
+    for team_name in teams_to_scrape:
+        tid, fbref_name = FBREF_TEAM_IDS[team_name]
+        fb = _fbref_team_stats(team_name, tid, fbref_name)
+        if fb is not None:
+            frames.append(fb)
+
+    if not frames:
+        return pd.DataFrame(columns=[
+            "player", "team", "goals_total", "goals_recent",
+            "caps_recent", "goal_rate", "pen_goals", "is_pen_taker", "start_prob"
+        ])
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.rename(columns={"fbref_goals": "goals_recent",
+                             "fbref_caps":  "caps_recent"})
+    df["goals_total"]  = df.get("goals_recent", 0)
+    df["goal_rate"]    = (
+        pd.to_numeric(df.get("goals_recent", 0), errors="coerce").fillna(0) /
+        pd.to_numeric(df.get("caps_recent",  1), errors="coerce").clip(lower=1).fillna(1)
+    )
+    df["pen_goals"]    = 0
+    df["is_pen_taker"] = 0
+    caps_max = pd.to_numeric(df.get("caps_recent", 1), errors="coerce").max()
+    df["start_prob"]   = (
+        0.5 + 0.35 * (
+            pd.to_numeric(df.get("caps_recent", 1), errors="coerce")
+            .fillna(0) / max(caps_max, 1)
+        ).clip(upper=1.0)
+    )
+    cols = ["player", "team", "goals_total", "goals_recent",
+            "caps_recent", "goal_rate", "pen_goals", "is_pen_taker", "start_prob"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0
+    return df[cols].dropna(subset=["player"])
+
+
 def fetch_players(wc_teams: list[str] | None = None,
                   enrich_fbref: bool = True,
                   force: bool = False) -> pd.DataFrame:
@@ -204,11 +251,16 @@ def fetch_players(wc_teams: list[str] | None = None,
     print("Construction des stats joueurs depuis goalscorers.csv...")
     df = _build_from_goalscorers(wc_list)
 
-    if enrich_fbref and wc_list:
+    if df.empty and enrich_fbref and wc_list:
+        # goalscorers.csv indisponible → construit entièrement depuis FBref
+        print("goalscorers.csv vide — construction depuis FBref...")
+        df = _build_from_fbref_only(wc_list)
+    elif enrich_fbref and wc_list:
         print("Enrichissement FBref (peut prendre quelques minutes)...")
         df = _enrich_with_fbref(df, wc_list)
 
     # Filtre final : au moins 1 but récent ou taux > 0
+    df["goals_recent"] = pd.to_numeric(df.get("goals_recent", 0), errors="coerce").fillna(0)
     df = df[df["goals_recent"] >= 1].copy()
     df = df.sort_values(["team", "goal_rate"], ascending=[True, False])
     df.to_csv(OUTPUT, index=False)
