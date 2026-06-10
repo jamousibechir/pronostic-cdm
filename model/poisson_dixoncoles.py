@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.stats import poisson
+from scipy.special import gammaln
 from pathlib import Path
 
 from config import DATA_DIR, HALF_LIFE_DAYS, MAX_GOALS, SEED
@@ -35,10 +36,6 @@ PARAMS_CACHE = DATA_DIR / "dc_params.pkl"
 # ── Correction Dixon-Coles ────────────────────────────────────────────────────
 
 def _tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
-    """
-    Facteur de correction DC pour les scores bas.
-    Évite les probabilités négatives : rho doit être dans [-1/(lam*mu), 1/lam, 1/mu].
-    """
     if x == 0 and y == 0:
         return 1.0 - lam * mu * rho
     elif x == 1 and y == 0:
@@ -58,15 +55,21 @@ def time_weight(date: pd.Timestamp, reference: pd.Timestamp,
     return float(np.exp(-np.log(2) * delta_days / half_life))
 
 
-# ── Log-vraisemblance ─────────────────────────────────────────────────────────
+# ── Log-vraisemblance vectorisée ─────────────────────────────────────────────
+# La version scalaire (boucle Python) prenait 20+ minutes sur 1882 matchs.
+# La version vectorisée numpy est ~200× plus rapide.
 
 def _neg_log_likelihood(params: np.ndarray,
-                         matches: pd.DataFrame,
-                         teams: list[str],
-                         ref_date: pd.Timestamp) -> float:
-    n = len(teams)
-    idx = {t: i for i, t in enumerate(teams)}
+                         h_idx: np.ndarray, a_idx: np.ndarray,
+                         x_arr: np.ndarray, y_arr: np.ndarray,
+                         neutrals: np.ndarray, weights: np.ndarray,
+                         n: int) -> float:
+    """
+    Vraisemblance négative Dixon-Coles entièrement vectorisée.
 
+    Paramètres pré-calculés hors de l'optimiseur (indices, scores, poids)
+    pour éviter tout accès DataFrame dans la boucle interne.
+    """
     log_alpha = params[:n]
     log_beta  = params[n:2*n]
     log_gamma = params[2*n]
@@ -76,32 +79,31 @@ def _neg_log_likelihood(params: np.ndarray,
     beta  = np.exp(log_beta)
     gamma = np.exp(log_gamma)
 
-    ll = 0.0
-    for row in matches.itertuples(index=False):
-        i = idx.get(row.home_team)
-        j = idx.get(row.away_team)
-        if i is None or j is None:
-            continue
+    g   = np.where(neutrals, 1.0, gamma)          # (N,)
+    lam = alpha[h_idx] * beta[a_idx] * g           # buts attendus domicile
+    mu  = alpha[a_idx] * beta[h_idx]               # buts attendus extérieur
 
-        x = int(row.home_score)
-        y = int(row.away_score)
-        neutral = bool(row.neutral)
+    # ── Correction Dixon-Coles (vectorisée) ───────────────────────────────────
+    tau = np.ones(len(x_arr))
+    m00 = (x_arr == 0) & (y_arr == 0)
+    m10 = (x_arr == 1) & (y_arr == 0)
+    m01 = (x_arr == 0) & (y_arr == 1)
+    m11 = (x_arr == 1) & (y_arr == 1)
+    tau[m00] = 1.0 - lam[m00] * mu[m00] * rho
+    tau[m10] = 1.0 + mu[m10] * rho
+    tau[m01] = 1.0 + lam[m01] * rho
+    tau[m11] = 1.0 - rho
 
-        g   = 1.0 if neutral else gamma
-        lam = alpha[i] * beta[j] * g
-        mu  = alpha[j] * beta[i]
+    if np.any(tau <= 0):
+        return 1e12
 
-        tau_val = _tau(x, y, lam, mu, rho)
-        if tau_val <= 0:
-            return 1e12   # paramètres invalides
+    # ── Log-PMF de Poisson (vectorisée via gammaln) ────────────────────────────
+    # logpmf(k, λ) = k·ln(λ) − λ − ln(k!)
+    log_p_h = x_arr * np.log(np.maximum(lam, 1e-10)) - lam - gammaln(x_arr + 1)
+    log_p_a = y_arr * np.log(np.maximum(mu,  1e-10)) - mu  - gammaln(y_arr + 1)
 
-        w = time_weight(pd.Timestamp(row.date), ref_date)
-        log_p = (np.log(tau_val)
-                 + poisson.logpmf(x, lam)
-                 + poisson.logpmf(y, mu))
-        ll += w * log_p
-
-    return -ll
+    log_p = np.log(tau) + log_p_h + log_p_a
+    return -float(np.dot(weights, log_p))
 
 
 # ── Estimation des paramètres ─────────────────────────────────────────────────
@@ -138,23 +140,35 @@ def estimate_parameters(matches: pd.DataFrame,
     matches = matches[
         matches["home_team"].isin(valid_teams) &
         matches["away_team"].isin(valid_teams)
-    ]
+    ].reset_index(drop=True)
 
     teams = sorted(set(matches["home_team"]) | set(matches["away_team"]))
     n = len(teams)
-    print(f"  Estimation DC : {n} équipes, {len(matches)} matchs")
+    print(f"  Estimation DC : {n} equipes, {len(matches)} matchs")
+
+    # ── Pré-calcul des arrays numpy (fait une seule fois hors de l'optimiseur) ──
+    team_idx = {t: i for i, t in enumerate(teams)}
+    h_idx    = np.array([team_idx[t] for t in matches["home_team"]], dtype=np.int32)
+    a_idx    = np.array([team_idx[t] for t in matches["away_team"]], dtype=np.int32)
+    x_arr    = matches["home_score"].to_numpy(dtype=np.float64)
+    y_arr    = matches["away_score"].to_numpy(dtype=np.float64)
+    neutrals = matches["neutral"].fillna(False).to_numpy(dtype=bool)
+
+    # Vecteur de poids temporels (calculé une fois)
+    ref_ts = ref_date
+    delta_days = (ref_ts - matches["date"]).dt.days.clip(lower=0).to_numpy(dtype=np.float64)
+    weights = np.exp(-np.log(2) * delta_days / HALF_LIFE_DAYS)
 
     # Paramètres initiaux
     x0 = np.zeros(2 * n + 2)
-    x0[2*n]     = np.log(1.15)  # gamma ≈ 1.15 (avantage domicile modéré)
-    x0[2*n + 1] = -0.10         # rho légèrement négatif
+    x0[2*n]     = np.log(1.15)
+    x0[2*n + 1] = -0.10
 
-    # Bornes
     bounds = (
-        [(-2.0, 2.0)] * n +    # log_alpha
-        [(-2.0, 2.0)] * n +    # log_beta
-        [(-0.5, 0.5)] +        # log_gamma
-        [(-0.9, 0.9)]          # rho
+        [(-2.0, 2.0)] * n +
+        [(-2.0, 2.0)] * n +
+        [(-0.5, 0.5)] +
+        [(-0.9, 0.9)]
     )
 
     with warnings.catch_warnings():
@@ -162,10 +176,10 @@ def estimate_parameters(matches: pd.DataFrame,
         result = minimize(
             _neg_log_likelihood,
             x0,
-            args=(matches, teams, ref_date),
+            args=(h_idx, a_idx, x_arr, y_arr, neutrals, weights, n),
             method="L-BFGS-B",
             bounds=bounds,
-            options={"maxiter": 3000, "ftol": 1e-9, "gtol": 1e-6},
+            options={"maxiter": 1000, "ftol": 1e-7, "gtol": 1e-5},
         )
 
     if not result.success:
