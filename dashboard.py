@@ -126,7 +126,7 @@ def _match_card(r):
             f'<span class="vs">vs</span><span class="t">{away}</span></div>'
             f'{score}'
             f'{stack}'
-            f'<div class="pick">Pronostic : <b>{html.escape(pick)}</b> '
+            f'<div class="pick">Vainqueur prédit : <b>{html.escape(pick)}</b> '
             f'({max(p1,pn,p2)*100:.0f}%)</div></div>')
 
 
@@ -170,8 +170,12 @@ def generate_dashboard() -> str:
                 f'<td class="c"><b>{int(r["home_real"])}–{int(r["away_real"])}</b></td>'
                 f'<td class="c">{"✓" if ok else "✗"}</td></tr>')
         played_html = (
-            '<table class="tbl"><thead><tr><th>Match</th><th>Pronostic</th>'
-            '<th>Réel</th><th></th></tr></thead><tbody>' + "".join(rows) + "</tbody></table>")
+            '<p class="legend">✓ = <b>vainqueur</b> correctement prédit. Le score exact '
+            '(souvent « 1-1 » indicatif) n\'entre PAS dans ce jugement : il est ~10% '
+            'prévisible pour n\'importe quel modèle.</p>'
+            '<table class="tbl"><thead><tr><th>Match</th><th>Pronostic (vainqueur)</th>'
+            '<th>Score réel</th><th>Bon&nbsp;?</th></tr></thead><tbody>'
+            + "".join(rows) + "</tbody></table>")
 
     # ── Favoris au titre ──
     champ_html = ""
