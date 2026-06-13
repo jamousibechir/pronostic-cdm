@@ -1,0 +1,6 @@
+{
+  "_comment": "Copier vers data/daily_adjustments.json. Malus/bonus en unites de log-force appliques avant la re-simulation. Ex: -0.15 ~ -14% de buts attendus. Negatif = affaibli (blessure/suspension d'un cadre), positif = renforce (retour de blessure).",
+  "France": -0.15,
+  "Brazil": -0.05,
+  "England": 0.0
+}
