@@ -20,8 +20,8 @@ import pandas as pd
 from collections import defaultdict
 from tqdm import tqdm
 
-from config import SEED, N_SIMULATIONS, N_THIRD_ADVANCE, MAX_GOALS
-from model.poisson_dixoncoles import predict_match, score_matrix
+from config import SEED, N_SIMULATIONS, N_THIRD_ADVANCE, MAX_GOALS, HOST_TEAMS
+from model.strength_poisson import expected_goals, score_matrix
 
 # ── Ordre de préférence des critères de classement FIFA (phase de groupes) ───
 # 1. Points  2. Diff buts  3. Buts marqués  4. H2H points  5. H2H diff buts
@@ -72,17 +72,10 @@ SHOOTOUT_P_WIN   = 0.50   # 50/50 aux t.a.b.
 
 def _sample_score(home: str, away: str, params: dict,
                   neutral: bool, rng: np.random.Generator) -> tuple[int, int]:
-    """Tire un score depuis la matrice de probabilité Dixon-Coles."""
-    alpha_h = params["alpha"].get(home, 1.0)
-    beta_h  = params["beta"].get(home,  1.0)
-    alpha_a = params["alpha"].get(away, 1.0)
-    beta_a  = params["beta"].get(away,  1.0)
-    rho     = params["rho"]
-    gamma   = 1.0 if neutral else params["gamma"]
-
-    mat = score_matrix(alpha_h, beta_h, alpha_a, beta_a, rho, gamma, MAX_GOALS)
-    flat_probs = mat.ravel()
-    flat_probs = np.maximum(flat_probs, 0)
+    """Tire un score depuis la matrice de probabilité (modèle force unique)."""
+    lam, mu = expected_goals(home, away, params, neutral=neutral, host_teams=HOST_TEAMS)
+    mat = score_matrix(lam, mu, params["rho"], MAX_GOALS)
+    flat_probs = np.maximum(mat.ravel(), 0)
     flat_probs /= flat_probs.sum()
 
     idx = rng.choice(len(flat_probs), p=flat_probs)
@@ -103,10 +96,9 @@ def _ko_match(home: str, away: str, params: dict,
         return winner, h, a
 
     # Prolongations (30 min ≈ 35 % des buts sur 90 min)
-    lam_et = params["alpha"].get(home, 1.0) * params["beta"].get(away, 1.0) * ET_LAMBDA_FACTOR
-    mu_et  = params["alpha"].get(away, 1.0) * params["beta"].get(home, 1.0) * ET_LAMBDA_FACTOR
-    h_et = int(rng.poisson(lam_et))
-    a_et = int(rng.poisson(mu_et))
+    lam, mu = expected_goals(home, away, params, neutral=True, host_teams=HOST_TEAMS)
+    h_et = int(rng.poisson(lam * ET_LAMBDA_FACTOR))
+    a_et = int(rng.poisson(mu  * ET_LAMBDA_FACTOR))
     h += h_et
     a += a_et
 
@@ -361,7 +353,7 @@ def _distribute_goals(team: str, goals: int,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_monte_carlo(groups: dict[str, list[str]],
-                    params: dict,
+                    params,                      # dict OU list[dict] (réplicas bootstrap)
                     played_matches: dict | None = None,
                     player_weights: dict | None = None,
                     n_sims: int = N_SIMULATIONS,
@@ -382,19 +374,20 @@ def run_monte_carlo(groups: dict[str, list[str]],
     """
     rng = np.random.default_rng(seed)
 
+    # params peut être un seul jeu ou une liste de réplicas bootstrap.
+    # Tirer un réplica par simulation propage l'incertitude d'estimation
+    # dans les probabilités de titre (sinon elles sont trop confiantes).
+    param_sets = params if isinstance(params, list) else [params]
+    n_sets = len(param_sets)
+
     champion_count:  defaultdict[str, int] = defaultdict(int)
-    finalist_count:  defaultdict[str, int] = defaultdict(int)
-    sf_count:        defaultdict[str, int] = defaultdict(int)
-    qf_count:        defaultdict[str, int] = defaultdict(int)
-    r16_count:       defaultdict[str, int] = defaultdict(int)
     player_total_goals: defaultdict[str, int] = defaultdict(int)
     player_top_scorer:  defaultdict[str, int] = defaultdict(int)
 
-    all_teams = [t for tl in groups.values() for t in tl]
-
     for _ in tqdm(range(n_sims), desc="Monte-Carlo simulations", unit="run"):
+        p = param_sets[rng.integers(n_sets)] if n_sets > 1 else param_sets[0]
         champion, p_goals = _run_tournament(
-            groups, params, rng, played_matches, player_weights
+            groups, p, rng, played_matches, player_weights
         )
         champion_count[champion] += 1
 
@@ -432,7 +425,16 @@ def build_groups_dict(fixtures: pd.DataFrame,
     """
     Construit {group_letter: [team1, team2, team3, team4]} depuis les DataFrames.
     """
-    if "group" not in wc_teams.columns or wc_teams["group"].isna().all():
+    # Les groupes de wc_teams ne sont fiables que s'ils contiennent des valeurs
+    # non vides (en mémoire football-data renvoie "", relu en NaN depuis le CSV).
+    def _has_real_groups(df: pd.DataFrame) -> bool:
+        if "group" not in df.columns:
+            return False
+        v = df["group"].astype(str).str.strip()
+        v = v[(v != "") & (v.str.lower() != "nan")]
+        return len(v) > 0
+
+    if not _has_real_groups(wc_teams):
         # Fallback : extrait les groupes depuis les fixtures phase de groupes
         gs = fixtures[fixtures["stage"].str.contains("GROUP", na=False, case=False)]
         groups: dict[str, list[str]] = {}

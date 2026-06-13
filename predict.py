@@ -19,8 +19,16 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+# Force UTF-8 output on Windows (évite UnicodeEncodeError avec PowerShell cp1252)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from config import (
     SEED, N_SIMULATIONS, OUTPUTS_DIR, DATA_DIR,
+    TRAIN_CUTOFF_YEARS, RIDGE_TEAM, RIDGE_CONF, N_BOOTSTRAP,
+    BOOTSTRAP_BLOCK, HOST_TEAMS,
 )
 from ingestion.elo_fetch        import fetch_elo
 from ingestion.fifa_ranking     import fetch_fifa_rankings
@@ -28,9 +36,13 @@ from ingestion.results_fetch    import recent_results
 from ingestion.fixtures_fetch   import fetch_fixtures, fetch_wc_teams, update_live_results
 from ingestion.players_fetch    import fetch_players
 from ingestion.competition_history import build_competition_history, team_summary
+from ingestion.confederations import confederation_map
 
-from model.poisson_dixoncoles import (
-    estimate_parameters, predict_match, save_params, load_params, apply_elo_prior,
+from model.strength_poisson import (
+    estimate_strengths, predict_match, save_params, load_params, bootstrap_strengths,
+)
+from model.calibration import (
+    load_calibrator, save_calibrator, train_temporal_calibrator,
 )
 from model.elo import build_elo_dict
 
@@ -60,11 +72,13 @@ def parse_args():
 
 def generate_match_predictions(fixtures: pd.DataFrame,
                                  params: dict,
-                                 history: pd.DataFrame | None = None) -> pd.DataFrame:
+                                 history: pd.DataFrame | None = None,
+                                 calibrator=None) -> pd.DataFrame:
     """
     Génère le CSV matchs.csv avec pour chaque match :
       score prédit (le plus probable) + P(1)/P(N)/P(2) + buts attendus
     Les matchs déjà joués ont leurs vrais scores figés.
+    Les probabilités 1/N/2 sont calibrées (isotonique) si un calibrateur est fourni.
     """
     rows = []
     for _, row in fixtures.iterrows():
@@ -76,29 +90,18 @@ def generate_match_predictions(fixtures: pd.DataFrame,
         status = str(row.get("status", "SCHEDULED"))
         stage  = str(row.get("stage", ""))
         grp    = str(row.get("group", ""))
+        has_score = pd.notna(row.get("home_score")) and pd.notna(row.get("away_score"))
 
-        if status == "FINISHED":
-            # Match joué : on conserve le vrai score
-            rows.append({
-                "stage":        stage,
-                "group":        grp,
-                "date":         row.get("utc_date", ""),
-                "home_team":    home,
-                "away_team":    away,
-                "pred_score":   f"{int(row['home_score'])}-{int(row['away_score'])}",
-                "actual_score": f"{int(row['home_score'])}-{int(row['away_score'])}",
-                "p_home_win":   None,
-                "p_draw":       None,
-                "p_away_win":   None,
-                "exp_home":     None,
-                "exp_away":     None,
-                "status":       "FINISHED",
-            })
-            continue
+        # On prédit TOUJOURS (probabilités + score indicatif), même pour un match
+        # déjà joué : c'est indispensable pour noter le modèle a posteriori (bilan).
+        # Le score réel est ajouté en plus quand il existe.
+        pred = predict_match(home, away, params, neutral=True, host_teams=HOST_TEAMS)
+        p_hw, p_d, p_aw = pred["prob_home_win"], pred["prob_draw"], pred["prob_away_win"]
+        if calibrator is not None:
+            p_hw, p_d, p_aw = calibrator.transform_one(p_hw, p_d, p_aw)
 
-        # Match à venir : prédiction DC
-        neutral = True  # CdM = terrain neutre
-        pred = predict_match(home, away, params, neutral=neutral)
+        actual = (f"{int(row['home_score'])}-{int(row['away_score'])}"
+                  if has_score else None)
 
         rows.append({
             "stage":        stage,
@@ -107,19 +110,19 @@ def generate_match_predictions(fixtures: pd.DataFrame,
             "home_team":    home,
             "away_team":    away,
             "pred_score":   f"{pred['most_likely_score'][0]}-{pred['most_likely_score'][1]}",
-            "actual_score": None,
-            "p_home_win":   round(pred["prob_home_win"], 4),
-            "p_draw":       round(pred["prob_draw"],     4),
-            "p_away_win":   round(pred["prob_away_win"], 4),
+            "actual_score": actual,
+            "p_home_win":   round(p_hw, 4),
+            "p_draw":       round(p_d,  4),
+            "p_away_win":   round(p_aw, 4),
             "exp_home":     round(pred["expected_home"], 3),
             "exp_away":     round(pred["expected_away"], 3),
-            "status":       "PREDICTED",
+            "status":       "FINISHED" if has_score else "PREDICTED",
         })
 
     df = pd.DataFrame(rows)
     out = OUTPUTS_DIR / "matchs.csv"
     df.to_csv(out, index=False)
-    print(f"Livrable 1 → {out}  ({len(df)} matchs)")
+    print(f"Livrable 1 -> {out}  ({len(df)} matchs)")
     return df
 
 
@@ -152,7 +155,7 @@ def generate_champion_csv(mc_results: dict,
     df = pd.DataFrame(rows).sort_values("win_prob", ascending=False)
     out = OUTPUTS_DIR / "champion.csv"
     df.to_csv(out, index=False)
-    print(f"Livrable 2 → {out}  ({len(df)} équipes)")
+    print(f"Livrable 2 -> {out}  ({len(df)} equipes)")
     return df
 
 
@@ -197,11 +200,16 @@ def generate_golden_boot_csv(mc_results: dict,
             "pen_taker":        info.get("is_pen_taker", "?"),
         })
 
-    df = pd.DataFrame(rows).sort_values("golden_boot_prob", ascending=False)
+    if rows:
+        df = pd.DataFrame(rows).sort_values("golden_boot_prob", ascending=False)
+    else:
+        df = pd.DataFrame(columns=["player", "team", "golden_boot_prob",
+                                    "golden_boot_pct", "avg_goals_per_sim",
+                                    "goals_last_2y", "goal_rate", "pen_taker"])
     out = OUTPUTS_DIR / "buteurs.csv"
     df.to_csv(out, index=False)
-    print(f"Livrable 3 → {out}  ({len(df)} joueurs)")
-    print("  ⚠ Soulier d'or : prédiction très incertaine (voir README).")
+    print(f"Livrable 3 -> {out}  ({len(df)} joueurs)")
+    print("  Avertissement : Soulier d'or - prediction tres incertaine (voir README).")
     return df
 
 
@@ -247,28 +255,41 @@ def main():
 
     players = fetch_players(
         wc_teams=wc_team_names,
-        enrich_fbref=True,
         force=force,
     )
 
     print(f"  {len(elo_df)} équipes Elo | {len(fifa_df)} équipes FIFA | "
           f"{len(fixtures)} matchs | {len(players)} joueurs")
 
-    # ── 2. Estimation du modèle ───────────────────────────────
-    print("\n[2/5] Estimation du modèle Dixon-Coles...")
+    # ── 2. Estimation du modèle (force unique + bootstrap) ────
+    print("\n[2/5] Estimation du modèle (Poisson force unique)...")
+
+    elo_dict  = build_elo_dict(elo_df)
+    conf_map  = confederation_map()
+    train_df  = recent_results(years=TRAIN_CUTOFF_YEARS, force=force)
 
     params = load_params()
     if params is None or force:
-        train_df = recent_results(force=force)
-        params   = estimate_parameters(train_df)
-
-        # Enrichit avec prior Elo pour les équipes peu représentées
-        elo_dict = build_elo_dict(elo_df)
-        params   = apply_elo_prior(params, elo_dict, weight=0.25)
-
+        params = estimate_strengths(train_df, ridge_team=RIDGE_TEAM, ridge_conf=RIDGE_CONF,
+                                    elo_dict=elo_dict, conf_map=conf_map)
         save_params(params)
     else:
         print(f"  Paramètres chargés depuis le cache ({len(params['teams'])} équipes)")
+
+    # Calibrateur isotonique (entraîné sur une fenêtre de validation récente)
+    calibrator = load_calibrator()
+    if calibrator is None or force:
+        print("  Calibration isotonique des probabilités 1/N/2...")
+        calibrator = train_temporal_calibrator(train_df, elo_dict=elo_dict,
+                                                ridge_team=RIDGE_TEAM, ridge_conf=RIDGE_CONF,
+                                                conf_map=conf_map)
+        save_calibrator(calibrator)
+
+    # Réplicas bootstrap : propagent l'incertitude d'estimation dans le Monte-Carlo
+    param_sets = bootstrap_strengths(train_df, params, B=N_BOOTSTRAP,
+                                     ridge_team=RIDGE_TEAM, ridge_conf=RIDGE_CONF,
+                                     elo_dict=elo_dict, conf_map=conf_map,
+                                     block=BOOTSTRAP_BLOCK, seed=SEED)
 
     # ── 3. Construction des structures de tournoi ─────────────
     print("\n[3/5] Construction du bracket CdM 2026...")
@@ -289,14 +310,15 @@ def main():
     # ── 4. Livrable 1 : scores par match ──────────────────────
     print("\n[4/5] Prédiction des scores...")
     history = build_competition_history(force=force)
-    matches_df = generate_match_predictions(fixtures, params, history)
+    matches_df = generate_match_predictions(fixtures, params, history,
+                                             calibrator=calibrator)
 
     # ── 5. Monte-Carlo ────────────────────────────────────────
     if not args.no_sim:
         print(f"\n[5/5] Monte-Carlo ({args.n_sims} simulations)...")
         mc = run_monte_carlo(
             groups=groups,
-            params=params,
+            params=param_sets,          # réplicas bootstrap -> incertitude propagée
             played_matches=played,
             player_weights=pl_weights,
             n_sims=args.n_sims,
@@ -319,6 +341,13 @@ def main():
                         "avg_goals_per_sim"]].head(10).to_string(index=False))
     else:
         print("\n[5/5] Mode --no-sim : simulation ignorée.")
+
+    # Dashboard HTML (ne doit jamais faire échouer le run)
+    try:
+        from dashboard import main as build_dashboard
+        build_dashboard()
+    except Exception as e:
+        print(f"  (dashboard non genere : {e})")
 
     print("\nTerminé. Fichiers dans outputs/")
 

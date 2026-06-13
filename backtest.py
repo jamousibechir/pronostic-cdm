@@ -1,234 +1,210 @@
 """
-Backtest et calibration du modèle Dixon-Coles.
+Backtest et calibration du modèle de buts à force unique.
 
-Protocole :
-  - Entraînement : matchs internationaux jusqu'à septembre 2024
-  - Test         : matchs internationaux octobre 2024 – mai 2026
-    (inclut UEFA Nations League, qualifications, amicaux, AFCON 2025,
-     Copa América 2024, Euros 2024, etc.)
-  - Métriques calculées :
-      Brier score     : qualité de la prédiction 1/N/2 (plus bas = meilleur)
-      Log-loss        : calibration probabiliste
-      RMSE buts       : erreur sur le score prédit
-      Accuracy 1/N/2  : taux de bonne prédiction de l'issue
-      Calibration plot: intervalles de confiance vs fréquences observées
+Protocole (sans fuite) :
+  - Entraînement : matchs <= 2024-09-30 (fenêtre glissante de `train_years`)
+  - Test         : 2024-10-01 -> 2026-05-31 (hors échantillon)
+  - Le ridge (shrinkage) est réglé sur une sous-validation temporelle DU TRAIN,
+    jamais sur le test.
+  - La calibration isotonique est ajustée sur une fenêtre de validation du train,
+    puis appliquée au test (métriques brutes ET calibrées rapportées).
+  - AUCUNE équipe n'est ignorée (le modèle gère les inconnues par repli Elo / force 0),
+    contrairement à l'ancien Dixon-Coles qui jetait ~23 % du test.
 
-Lancer : python backtest.py
+Métriques : Brier, log-loss, accuracy 1/N/2, RMSE buts, courbe de calibration.
 """
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
-from config import DATA_DIR, OUTPUTS_DIR, SEED, HALF_LIFE_DAYS
+from config import OUTPUTS_DIR, RIDGE_TEAM, RIDGE_CONF
 from ingestion.results_fetch import fetch_results
-from model.poisson_dixoncoles import (
-    estimate_parameters, predict_match, save_params,
-)
+from ingestion.elo_fetch import fetch_elo
+from ingestion.confederations import confederation_map
+from model.elo import build_elo_dict
+from model.strength_poisson import estimate_strengths, predict_match
+from model.calibration import MultiClassCalibrator
 
 TRAIN_END   = "2024-09-30"
 TEST_START  = "2024-10-01"
 TEST_END    = "2026-05-31"
+TRAIN_YEARS = 10
+# Grille log-restreinte 2-D : (shrinkage équipe->confédération, confédération->global)
+RIDGE_TEAM_GRID = [0.5, 2.0, 8.0]
+RIDGE_CONF_GRID = [0.1, 1.0, 10.0]
 BACKTEST_OUT = OUTPUTS_DIR / "backtest_metrics.csv"
 
 
-def brier_score(probs: np.ndarray, outcomes: np.ndarray) -> float:
-    """Brier score multi-classe. probs.shape = (N, 3), outcomes.shape = (N,) ∈ {0,1,2}."""
+# ── Métriques ─────────────────────────────────────────────────────────────────
+
+def brier_score(probs, outcomes):
     one_hot = np.zeros_like(probs)
-    for i, o in enumerate(outcomes):
-        one_hot[i, int(o)] = 1.0
+    one_hot[np.arange(len(outcomes)), outcomes] = 1.0
     return float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
 
 
-def log_loss(probs: np.ndarray, outcomes: np.ndarray,
-             eps: float = 1e-9) -> float:
-    """Log-loss multi-classe."""
-    n = len(outcomes)
-    ll = 0.0
-    for i, o in enumerate(outcomes):
-        ll += np.log(max(probs[i, int(o)], eps))
-    return -ll / n
+def log_loss(probs, outcomes, eps=1e-9):
+    p = np.clip(probs[np.arange(len(outcomes)), outcomes], eps, 1)
+    return float(-np.mean(np.log(p)))
 
 
-def accuracy(probs: np.ndarray, outcomes: np.ndarray) -> float:
-    preds = np.argmax(probs, axis=1)
-    return float(np.mean(preds == outcomes))
+def accuracy(probs, outcomes):
+    return float(np.mean(np.argmax(probs, axis=1) == outcomes))
 
 
-def run_backtest(train_years: int = 6,
-                 verbose: bool = True) -> pd.DataFrame:
+def _predict_set(matches, params):
+    """Prédit un ensemble de matchs. Retourne (probs Nx3, outcomes, xg_home, xg_away, actual)."""
+    probs, outs, xh, xa, ah, aa = [], [], [], [], [], []
+    for _, r in matches.iterrows():
+        pred = predict_match(str(r["home_team"]), str(r["away_team"]),
+                             params, neutral=bool(r["neutral"]))
+        probs.append([pred["prob_home_win"], pred["prob_draw"], pred["prob_away_win"]])
+        hs, as_ = int(r["home_score"]), int(r["away_score"])
+        outs.append(0 if hs > as_ else 1 if hs == as_ else 2)
+        xh.append(pred["expected_home"]); xa.append(pred["expected_away"])
+        ah.append(hs); aa.append(as_)
+    return (np.array(probs), np.array(outs),
+            np.array(xh), np.array(xa), np.array(ah), np.array(aa))
+
+
+def _tune_ridges(train, elo_dict, conf_map, verbose=True):
     """
-    Lance le backtest complet.
-
-    Returns
-    -------
-    pd.DataFrame avec les métriques globales + par compétition
+    Règle ridge_team par validation temporelle. ridge_conf est FIXÉ (config) :
+    la validation est dominée par l'intra-confédération, où le niveau de
+    confédération s'annule dans (r_i − r_j) ; elle ne peut donc pas le régler.
+    On imprime quand même la sensibilité à ridge_conf pour transparence.
     """
+    train = train.sort_values("date")
+    cutoff = train["date"].max() - pd.DateOffset(months=18)
+    sub_tr = train[train["date"] <= cutoff]
+    sub_va = train[train["date"] > cutoff]
+    if len(sub_va) < 100 or len(sub_tr) < 500:
+        return RIDGE_TEAM, RIDGE_CONF
+
+    best_rt, best_ll = RIDGE_TEAM, np.inf
+    for rt in RIDGE_TEAM_GRID:
+        p = estimate_strengths(sub_tr, ref_date=cutoff, ridge_team=rt,
+                               ridge_conf=RIDGE_CONF, elo_dict=elo_dict,
+                               conf_map=conf_map, verbose=False)
+        probs, outs, *_ = _predict_set(sub_va, p)
+        ll = log_loss(probs, outs)
+        if verbose:
+            print(f"    ridge_team={rt:4.1f} (ridge_conf={RIDGE_CONF}) -> val log-loss={ll:.4f}")
+        if ll < best_ll:
+            best_ll, best_rt = ll, rt
+
+    # Sensibilité (informative) à ridge_conf, au meilleur ridge_team
+    if verbose:
+        for rc in RIDGE_CONF_GRID:
+            p = estimate_strengths(sub_tr, ref_date=cutoff, ridge_team=best_rt,
+                                   ridge_conf=rc, elo_dict=elo_dict,
+                                   conf_map=conf_map, verbose=False)
+            probs, outs, *_ = _predict_set(sub_va, p)
+            print(f"    [info] ridge_conf={rc:5.1f} -> val log-loss={log_loss(probs, outs):.4f} "
+                  f"(quasi insensible -> fixe a {RIDGE_CONF} par prior)")
+    print(f"  Retenu : ridge_team={best_rt}  ridge_conf={RIDGE_CONF} (prior)")
+    return best_rt, RIDGE_CONF
+
+
+# ── Backtest ──────────────────────────────────────────────────────────────────
+
+def run_backtest(verbose: bool = True) -> pd.DataFrame:
     print("=" * 60)
-    print("BACKTEST — Calibration du modèle Dixon-Coles")
+    print("BACKTEST - modele force unique")
     print("=" * 60)
 
     results = fetch_results()
+    results["date"] = pd.to_datetime(results["date"])
+    elo_dict = build_elo_dict(fetch_elo())
+    conf_map = confederation_map()
 
-    train_df = results[results["date"] <= TRAIN_END].copy()
-    test_df  = results[
-        (results["date"] >= TEST_START) &
-        (results["date"] <= TEST_END)
-    ].copy()
+    train_start = pd.Timestamp(TRAIN_END) - pd.DateOffset(years=TRAIN_YEARS)
+    train = results[(results["date"] >= train_start) & (results["date"] <= TRAIN_END)].copy()
+    test  = results[(results["date"] >= TEST_START) & (results["date"] <= TEST_END)].copy()
+    print(f"  Entrainement : {len(train)} matchs ({train_start.date()} -> {TRAIN_END})")
+    print(f"  Test         : {len(test)} matchs ({TEST_START} -> {TEST_END})")
 
-    print(f"  Entraînement : {len(train_df)} matchs (jusqu'à {TRAIN_END})")
-    print(f"  Test         : {len(test_df)} matchs ({TEST_START} – {TEST_END})")
+    # ── Réglage des deux ridges sur validation interne ──
+    print("\nReglage du shrinkage (2 niveaux) sur validation temporelle...")
+    ridge_team, ridge_conf = _tune_ridges(train, elo_dict, conf_map, verbose=verbose)
 
-    # Estimation des paramètres sur train
-    print("\nEstimation des paramètres Dixon-Coles...")
+    # ── Modèle final + calibrateur (tous deux sans toucher au test) ──
+    print("\nEstimation du modele final...")
+    # NB : le backtest est purement évaluatif — il n'écrit JAMAIS les caches de
+    # production (strength_params.pkl / calibrators.pkl), sinon predict.py
+    # rechargerait un modèle entraîné seulement jusqu'à TRAIN_END.
     ref_date = pd.Timestamp(TRAIN_END)
-    params = estimate_parameters(train_df, ref_date=ref_date)
-    save_params(params)
-    print(f"  {len(params['teams'])} équipes modélisées")
-    print(f"  gamma (avantage domicile) = {params['gamma']:.3f}")
-    print(f"  rho (correction DC)       = {params['rho']:.4f}")
+    params = estimate_strengths(train, ref_date=ref_date, ridge_team=ridge_team,
+                                ridge_conf=ridge_conf, elo_dict=elo_dict, conf_map=conf_map)
+    print(f"  beta0={params['beta0']:.3f}  home_adv={params['home_adv']:.3f}  "
+          f"rho={params['rho']:.4f}  ({len(params['teams'])} equipes)")
 
-    # Prédictions sur le jeu de test
-    print("\nPrédictions sur le jeu de test...")
-    rows = []
-    probs_list = []
-    outcomes_list = []
-    home_pred_list = []
-    away_pred_list = []
-    home_actual_list = []
-    away_actual_list = []
+    # Calibrateur : ajusté sur une fenêtre de validation du train
+    cal_cut = train["date"].max() - pd.DateOffset(months=18)
+    cal_tr  = train[train["date"] <= cal_cut]
+    cal_va  = train[train["date"] > cal_cut]
+    cal = MultiClassCalibrator()
+    if len(cal_va) >= 100 and len(cal_tr) >= 500:
+        cal_params = estimate_strengths(cal_tr, ref_date=cal_cut, ridge_team=ridge_team,
+                                        ridge_conf=ridge_conf, elo_dict=elo_dict,
+                                        conf_map=conf_map, verbose=False)
+        cp, co, *_ = _predict_set(cal_va, cal_params)
+        cal.fit(cp, co)
 
-    skipped = 0
-    for _, row in test_df.iterrows():
-        home = str(row["home_team"])
-        away = str(row["away_team"])
+    # ── Évaluation sur le test (aucune équipe ignorée) ──
+    print("\nPredictions sur le test (aucune equipe ignoree)...")
+    probs, outs, xh, xa, ah, aa = _predict_set(test, params)
+    probs_cal = cal.transform(probs)
 
-        # Saute si l'équipe est inconnue du modèle
-        if (home not in params["alpha"] or away not in params["alpha"]):
-            skipped += 1
-            continue
+    def block(tag, P):
+        bs, ll, acc = brier_score(P, outs), log_loss(P, outs), accuracy(P, outs)
+        print(f"  [{tag}] Brier={bs:.4f}  LogLoss={ll:.4f}  Acc={acc*100:.1f}%")
+        return bs, ll, acc
 
-        pred = predict_match(home, away, params,
-                              neutral=bool(row["neutral"]))
+    print("\n-- Metriques globales (reference naif 1/3 : Brier 0.667) --")
+    bs_r, ll_r, acc_r = block("brut    ", probs)
+    bs_c, ll_c, acc_c = block("calibre ", probs_cal)
+    rmse_h = float(np.sqrt(np.mean((xh - ah) ** 2)))
+    rmse_a = float(np.sqrt(np.mean((xa - aa) ** 2)))
+    print(f"  RMSE buts : dom={rmse_h:.3f}  ext={rmse_a:.3f}")
 
-        p_hw = pred["prob_home_win"]
-        p_d  = pred["prob_draw"]
-        p_aw = pred["prob_away_win"]
+    # ── Calibration P(victoire domicile) ──
+    print("\n-- Calibration P(victoire domicile) [brut -> calibre] --")
+    cal_err_raw, cal_err_cal = _calibration_report(probs, probs_cal, outs)
 
-        hs = int(row["home_score"])
-        as_ = int(row["away_score"])
-
-        if hs > as_:
-            outcome = 0   # home win
-        elif hs == as_:
-            outcome = 1   # draw
-        else:
-            outcome = 2   # away win
-
-        probs_list.append([p_hw, p_d, p_aw])
-        outcomes_list.append(outcome)
-        home_pred_list.append(pred["expected_home"])
-        away_pred_list.append(pred["expected_away"])
-        home_actual_list.append(hs)
-        away_actual_list.append(as_)
-
-        rows.append({
-            "date":       row["date"],
-            "tournament": row.get("tournament", ""),
-            "home_team":  home,
-            "away_team":  away,
-            "home_actual": hs,
-            "away_actual": as_,
-            "home_pred":  pred["expected_home"],
-            "away_pred":  pred["expected_away"],
-            "most_likely": f"{pred['most_likely_score'][0]}-{pred['most_likely_score'][1]}",
-            "p_home_win": p_hw,
-            "p_draw":     p_d,
-            "p_away_win": p_aw,
-            "outcome":    ["H", "D", "A"][outcome],
-            "correct":    ["H", "D", "A"][int(np.argmax([p_hw, p_d, p_aw]))] == ["H", "D", "A"][outcome],
-        })
-
-    print(f"  Matchs prédits : {len(rows)}  |  ignorés (équipe inconnue) : {skipped}")
-
-    probs_arr    = np.array(probs_list)
-    outcomes_arr = np.array(outcomes_list)
-    h_pred = np.array(home_pred_list)
-    a_pred = np.array(away_pred_list)
-    h_act  = np.array(home_actual_list)
-    a_act  = np.array(away_actual_list)
-
-    bs  = brier_score(probs_arr, outcomes_arr)
-    ll  = log_loss(probs_arr, outcomes_arr)
-    acc = accuracy(probs_arr, outcomes_arr)
-    rmse_h = float(np.sqrt(np.mean((h_pred - h_act) ** 2)))
-    rmse_a = float(np.sqrt(np.mean((a_pred - a_act) ** 2)))
-
-    print("\n── Métriques globales ──────────────────────────────────")
-    print(f"  Brier score      : {bs:.4f}  (référence naïf 1/3 = 0.667)")
-    print(f"  Log-loss         : {ll:.4f}")
-    print(f"  Accuracy 1/N/2   : {acc:.3f}  ({acc*100:.1f}%)")
-    print(f"  RMSE buts dom.   : {rmse_h:.3f}")
-    print(f"  RMSE buts ext.   : {rmse_a:.3f}")
-
-    # ── Calibration par quantile de probabilité ──
-    print("\n── Calibration P(victoire domicile) ────────────────────")
-    calibration_rows = []
-    p_home = probs_arr[:, 0]
-    bins = np.linspace(0, 1, 11)
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (p_home >= lo) & (p_home < hi)
-        if mask.sum() == 0:
-            continue
-        mean_pred = float(p_home[mask].mean())
-        mean_obs  = float((outcomes_arr[mask] == 0).mean())
-        n         = int(mask.sum())
-        calibration_rows.append({
-            "bin": f"[{lo:.1f},{hi:.1f})",
-            "mean_pred": mean_pred,
-            "mean_obs":  mean_obs,
-            "n":         n,
-            "error":     abs(mean_pred - mean_obs),
-        })
-        print(f"  {f'[{lo:.1f},{hi:.1f})':<12}  prédit={mean_pred:.3f}  observé={mean_obs:.3f}  n={n}")
-
-    cal_df = pd.DataFrame(calibration_rows)
-    mean_cal_error = float(cal_df["error"].mean()) if not cal_df.empty else np.nan
-    print(f"\n  Erreur de calibration moyenne : {mean_cal_error:.4f}")
-
-    # ── Métriques par compétition ────────────────────────────────
-    details_df = pd.DataFrame(rows)
-    if not details_df.empty:
-        print("\n── Accuracy par compétition (top 10) ───────────────────")
-        comp_stats = (
-            details_df.groupby("tournament")["correct"]
-            .agg(["mean", "count"])
-            .rename(columns={"mean": "accuracy", "count": "n_matches"})
-            .sort_values("n_matches", ascending=False)
-            .head(10)
-        )
-        print(comp_stats.to_string())
-
-    # ── Sauvegarde ─────────────────────────────────────────────
     metrics = pd.DataFrame([{
-        "brier_score":    bs,
-        "log_loss":       ll,
-        "accuracy":       acc,
-        "rmse_home":      rmse_h,
-        "rmse_away":      rmse_a,
-        "cal_error_mean": mean_cal_error,
-        "n_matches":      len(rows),
-        "train_cutoff":   TRAIN_END,
-        "test_start":     TEST_START,
+        "ridge_team": ridge_team, "ridge_conf": ridge_conf,
+        "brier_raw": bs_r, "logloss_raw": ll_r, "acc_raw": acc_r,
+        "brier_cal": bs_c, "logloss_cal": ll_c, "acc_cal": acc_c,
+        "rmse_home": rmse_h, "rmse_away": rmse_a,
+        "cal_err_raw": cal_err_raw, "cal_err_cal": cal_err_cal,
+        "n_test": len(test), "n_skipped": 0,
     }])
     metrics.to_csv(BACKTEST_OUT, index=False)
-    print(f"\nMétriques sauvegardées → {BACKTEST_OUT}")
-
-    if verbose and not details_df.empty:
-        details_path = OUTPUTS_DIR / "backtest_details.csv"
-        details_df.to_csv(details_path, index=False)
-        print(f"Détails match par match → {details_path}")
-
+    print(f"\nMetriques sauvegardees -> {BACKTEST_OUT}")
     return metrics
+
+
+def _calibration_report(probs, probs_cal, outs):
+    bins = np.linspace(0, 1, 11)
+    errs_raw, errs_cal = [], []
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        m = (probs[:, 0] >= lo) & (probs[:, 0] < hi)
+        if m.sum() == 0:
+            continue
+        obs = (outs[m] == 0).mean()
+        pr  = probs[m, 0].mean()
+        mc = (probs_cal[:, 0] >= lo) & (probs_cal[:, 0] < hi)
+        pc  = probs_cal[mc, 0].mean() if mc.sum() else np.nan
+        oc  = (outs[mc] == 0).mean() if mc.sum() else np.nan
+        errs_raw.append(abs(pr - obs))
+        if mc.sum():
+            errs_cal.append(abs(pc - oc))
+        print(f"  [{lo:.1f},{hi:.1f})  brut pred={pr:.3f} obs={obs:.3f} (n={m.sum():3d})"
+              f"   | calibre pred={pc:.3f} obs={oc:.3f}")
+    er = float(np.mean(errs_raw)) if errs_raw else np.nan
+    ec = float(np.mean(errs_cal)) if errs_cal else np.nan
+    print(f"  Erreur de calibration moyenne : brut={er:.4f}  calibre={ec:.4f}")
+    return er, ec
 
 
 if __name__ == "__main__":
