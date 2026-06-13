@@ -28,7 +28,7 @@ if hasattr(sys.stderr, "reconfigure"):
 from config import (
     SEED, N_SIMULATIONS, OUTPUTS_DIR, DATA_DIR,
     TRAIN_CUTOFF_YEARS, RIDGE_TEAM, RIDGE_CONF, N_BOOTSTRAP,
-    BOOTSTRAP_BLOCK, HOST_TEAMS, PREDICTIONS_LOG,
+    BOOTSTRAP_BLOCK, HOST_TEAMS, PREDICTIONS_LOG, WC_K_FACTOR, WC_SINCE,
 )
 from ingestion.elo_fetch        import fetch_elo
 from ingestion.fifa_ranking     import fetch_fifa_rankings
@@ -64,6 +64,56 @@ def parse_args():
     p.add_argument("--n-sims",   type=int, default=N_SIMULATIONS,
                    help=f"Nombre de simulations (défaut: {N_SIMULATIONS})")
     return p.parse_args()
+
+
+def _merge_live_wc_results(train_df: pd.DataFrame, fixtures: pd.DataFrame) -> pd.DataFrame:
+    """
+    Injecte les résultats CdM 2026 DÉJÀ JOUÉS (depuis football-data, temps réel)
+    dans le jeu d'entraînement. Sans ça, le modèle n'apprend un match que lorsque
+    martj42 le publie (~1 jour de retard) — on perd en réactivité pendant le tournoi.
+    Les doublons (date+équipes) sont dédupliqués en gardant la version live.
+    """
+    if fixtures.empty:
+        return train_df
+    played = fixtures[fixtures["home_score"].notna() & fixtures["away_score"].notna()].copy()
+    if played.empty:
+        return train_df
+    # Dates en tz-naïf à minuit, pour coller au format martj42 (sinon comparaison
+    # tz-aware/tz-naïf KO et déduplication ratée).
+    live_dates = (pd.to_datetime(played["utc_date"], errors="coerce", utc=True)
+                  .dt.tz_localize(None).dt.normalize())
+    live = pd.DataFrame({
+        "date":       live_dates,
+        "home_team":  played["home_team"], "away_team": played["away_team"],
+        "home_score": played["home_score"].astype(int),
+        "away_score": played["away_score"].astype(int),
+        "tournament": "FIFA World Cup", "neutral": True,
+    })
+    out = pd.concat([train_df, live], ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out = out.drop_duplicates(subset=["date", "home_team", "away_team"], keep="last")
+    print(f"  Resultats CdM live injectes dans l'entrainement : {len(live)} match(s)")
+    return out
+
+
+def _apply_tournament_weight(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apprentissage en tournoi : les matchs de la CdM EN COURS reçoivent un poids
+    fortement majoré (K-factor), pour que le modèle réagisse vite à la forme du
+    moment. Sans ça, un match du Mondial pèse comme un amical noyé dans ~8 ans
+    de données et le modèle reste figé sur ses a priori d'avant-tournoi.
+    """
+    df = df.copy()
+    df["weight_mult"] = 1.0
+    dt = pd.to_datetime(df["date"])
+    wc = (df["tournament"].str.contains("World Cup", case=False, na=False)
+          & ~df["tournament"].str.contains("qualification", case=False, na=False)
+          & (dt >= pd.Timestamp(WC_SINCE)))
+    df.loc[wc, "weight_mult"] = WC_K_FACTOR
+    n = int(wc.sum())
+    if n:
+        print(f"  Apprentissage en tournoi : K-factor {WC_K_FACTOR}x sur {n} match(s) CdM")
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,6 +356,8 @@ def main():
     elo_dict  = build_elo_dict(elo_df)
     conf_map  = confederation_map()
     train_df  = recent_results(years=TRAIN_CUTOFF_YEARS, force=force)
+    train_df  = _merge_live_wc_results(train_df, fixtures)  # résultats CdM live (anti-retard martj42)
+    train_df  = _apply_tournament_weight(train_df)          # apprentissage en tournoi (K-factor)
 
     params = load_params()
     if params is None or force:

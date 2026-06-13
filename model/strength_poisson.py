@@ -134,6 +134,7 @@ def estimate_strengths(matches: pd.DataFrame,
                        min_matches: int = 3,
                        elo_dict: dict[str, float] | None = None,
                        conf_map: dict[str, str] | None = None,
+                       half_life: float = HALF_LIFE_DAYS,
                        verbose: bool = True) -> dict:
     """
     Estime les forces par MLE pondéré + prior hiérarchique à deux niveaux.
@@ -181,7 +182,7 @@ def estimate_strengths(matches: pd.DataFrame,
     nn = (~m["neutral"].fillna(False).to_numpy(bool)).astype(np.float64)  # 1 si domicile réel
 
     delta = (ref_date - m["date"]).dt.days.clip(lower=0).to_numpy(np.float64)
-    w = np.exp(-np.log(2) * delta / HALF_LIFE_DAYS)
+    w = np.exp(-np.log(2) * delta / half_life)
     # K-factor : un multiplicateur de poids par match (colonne optionnelle)
     # permet d'amplifier les matchs du Mondial en cours (apprentissage rapide
     # de la forme actuelle) — voir update_daily.py.
@@ -266,6 +267,7 @@ def bootstrap_strengths(matches: pd.DataFrame,
                         elo_dict: dict[str, float] | None = None,
                         conf_map: dict[str, str] | None = None,
                         block: str = "tournament",
+                        half_life: float = HALF_LIFE_DAYS,
                         seed: int = 42) -> list[dict]:
     """
     Ré-estime le modèle sur B rééchantillonnages bootstrap des matchs.
@@ -311,7 +313,8 @@ def bootstrap_strengths(matches: pd.DataFrame,
         try:
             p = estimate_strengths(sample, ref_date=ref_date,
                                    ridge_team=ridge_team, ridge_conf=ridge_conf,
-                                   elo_dict=elo_dict, conf_map=conf_map, verbose=False)
+                                   elo_dict=elo_dict, conf_map=conf_map,
+                                   half_life=half_life, verbose=False)
         except Exception:
             continue
         merged = dict(base_strength)

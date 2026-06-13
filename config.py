@@ -58,7 +58,7 @@ HOST_ADVANTAGE = 0.12
 
 # ── Mise à jour quotidienne en tournoi (update_daily.py) ─────────────────────
 XG_BLEND    = 0.5          # score effectif = XG_BLEND*xG + (1-XG_BLEND)*score réel
-WC_K_FACTOR = 8.0          # poids majoré des matchs CdM en cours (forme actuelle)
+WC_K_FACTOR = 5.0          # poids majoré des matchs CdM en cours (réagir sans surréagir)
 WC_SINCE    = "2026-06-01" # date à partir de laquelle un match "World Cup" est en cours
 
 # ── Monte-Carlo ───────────────────────────────────────────────────────────────
