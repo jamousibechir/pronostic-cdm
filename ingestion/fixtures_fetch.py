@@ -15,6 +15,7 @@ import requests
 import pandas as pd
 
 from config import DATA_DIR, FOOTBALL_DATA_BASE, FOOTBALL_DATA_API_KEY
+from ingestion.names import canonical
 
 HEADERS = {
     "X-Auth-Token": FOOTBALL_DATA_API_KEY,
@@ -52,8 +53,8 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
 def _parse_matches(data: dict) -> pd.DataFrame:
     rows = []
     for m in data.get("matches", []):
-        home = m["homeTeam"].get("name") or m["homeTeam"].get("shortName")
-        away = m["awayTeam"].get("name") or m["awayTeam"].get("shortName")
+        home = canonical(m["homeTeam"].get("name") or m["homeTeam"].get("shortName") or "")
+        away = canonical(m["awayTeam"].get("name") or m["awayTeam"].get("shortName") or "")
         score = m.get("score", {})
         full  = score.get("fullTime", {})
         rows.append({
@@ -79,7 +80,7 @@ def _parse_teams(data: dict) -> pd.DataFrame:
     for t in data.get("teams", []):
         rows.append({
             "team_id": t["id"],
-            "team":    t["name"],
+            "team":    canonical(t["name"]),
             "tla":     t.get("tla", ""),
             "group":   t.get("group", ""),
         })

@@ -1,195 +1,142 @@
 """
-Extrait l'historique des grandes compétitions par équipe.
+Palmarès historique des grandes compétitions, par équipe.
 
-Source : results.csv (martj42) — champ `tournament`
+Coupe du Monde : piloté par les données jfjelstul/worldcup, qui fournit le
+`stage_name` ('final', 'semi-finals', ...) absent de martj42. On détecte le
+champion / finaliste / demi-finaliste de chaque édition à partir des matchs KO.
 
-Grandes compétitions couvertes :
-  - FIFA World Cup (1930 → 2022)
-  - UEFA European Championship (1960 → 2024)
-  - Copa América (1916 → 2024)
-  - Africa Cup of Nations (1957 → 2024)
-  - AFC Asian Cup (1956 → 2023)
-  - CONCACAF Gold Cup (1941 → 2023)
+Euro & Copa América : tables de référence (palmarès public, stable) — utilisées
+seulement pour enrichir l'affichage de champion.csv, pas pour la prédiction.
 
-Sortie : data/competition_history.csv
-Colonnes : team, competition, year, round, is_champion, is_finalist,
-           is_semifinalist, is_quarterfinalist
+Sortie : data/competition_history.csv (WC détaillé) + team_summary() agrège tout.
 """
+import io
+import requests
 import pandas as pd
-import numpy as np
 
-from config import DATA_DIR, MAJOR_TOURNAMENTS
-from ingestion.results_fetch import fetch_results
+from config import DATA_DIR
+from ingestion.names import canonical
 
 OUTPUT = DATA_DIR / "competition_history.csv"
+JFJELSTUL_URL = "https://raw.githubusercontent.com/jfjelstul/worldcup/master/data-csv/matches.csv"
+UA = {"User-Agent": "Mozilla/5.0"}
 
-# Mapping pour normaliser les noms de tournois dans results.csv
-TOURNAMENT_LABELS = {
-    "FIFA World Cup":               "World Cup",
-    "UEFA Euro":                    "Euro",
-    "Copa América":                 "Copa America",
-    "Africa Cup of Nations":        "AFCON",
-    "AFC Asian Cup":                "Asian Cup",
-    "CONCACAF Gold Cup":            "Gold Cup",
-    "FIFA Confederations Cup":      "Confederations Cup",
+_STAGE_ORDER = {
+    "group stage": 0, "first round": 0,
+    "round of 16": 1, "second round": 1,
+    "quarter-finals": 2, "semi-finals": 3,
+    "third-place match": 3, "final": 4,
 }
 
-# Mots-clés de stade (pour détecter le round depuis le nom du tournoi absent)
-ROUND_KW = {
-    "final":        "Final",
-    "semi":         "Semi-final",
-    "quarter":      "Quarter-final",
-    "round of 16":  "Round of 16",
-    "round of 32":  "Round of 32",
-    "group":        "Group stage",
+# ── Palmarès Euro (titres par nation, ères modernes regroupées) ───────────────
+EURO_TITLES = {
+    "Spain": 4, "Germany": 3, "France": 2, "Italy": 2,
+    "Portugal": 1, "Netherlands": 1, "Denmark": 1, "Greece": 1,
+    "Czech Republic": 1, "Russia": 1,
+}
+# ── Palmarès Copa América (titres historiques par nation) ─────────────────────
+COPA_TITLES = {
+    "Argentina": 16, "Uruguay": 15, "Brazil": 9, "Paraguay": 2,
+    "Peru": 2, "Chile": 2, "Colombia": 1, "Bolivia": 1,
 }
 
 
-def _detect_round(tournament: str) -> str:
-    t = tournament.lower()
-    for kw, label in ROUND_KW.items():
-        if kw in t:
-            return label
-    return "Group stage"
-
-
-def _process_competition(df_comp: pd.DataFrame,
-                          comp_name: str) -> pd.DataFrame:
-    """
-    Pour une compétition donnée, détermine le round atteint par chaque équipe
-    et par année d'édition.
-    """
-    # Identifie les éditions par année
-    df_comp = df_comp.copy()
-    df_comp["year"] = df_comp["date"].dt.year
-
-    records = []
-    for year, df_year in df_comp.groupby("year"):
-        # Toutes les équipes qui ont joué cette édition
-        teams_in = set(df_year["home_team"]) | set(df_year["away_team"])
-
-        # Meilleur round atteint par équipe dans cette édition
-        round_order = {
-            "Group stage": 0, "Round of 32": 1, "Round of 16": 2,
-            "Quarter-final": 3, "Semi-final": 4, "Final": 5,
-        }
-
-        team_rounds: dict[str, str] = {t: "Group stage" for t in teams_in}
-        team_champion: dict[str, bool] = {t: False for t in teams_in}
-
-        for _, row in df_year.iterrows():
-            rnd   = _detect_round(row.get("tournament", ""))
-            home  = row["home_team"]
-            away  = row["away_team"]
-            for team in [home, away]:
-                if team in team_rounds:
-                    if round_order.get(rnd, 0) > round_order.get(team_rounds[team], 0):
-                        team_rounds[team] = rnd
-
-        # Vainqueur = équipe qui a gagné la finale
-        finals = df_year[df_year["tournament"].str.lower().str.contains("final", na=False)
-                         & ~df_year["tournament"].str.lower().str.contains("semi", na=False)
-                         & ~df_year["tournament"].str.lower().str.contains("third", na=False)
-                         & ~df_year["tournament"].str.lower().str.contains("3rd", na=False)]
-
-        if not finals.empty:
-            last_final = finals.sort_values("date").iloc[-1]
-            h, a = last_final["home_team"], last_final["away_team"]
-            hs, as_ = last_final["home_score"], last_final["away_score"]
-            if hs > as_:
-                team_champion[h] = True
-                team_rounds[h] = "Final"
-                team_rounds[a] = "Final"
-            elif as_ > hs:
-                team_champion[a] = True
-                team_rounds[h] = "Final"
-                team_rounds[a] = "Final"
-
-        for team, rnd in team_rounds.items():
-            records.append({
-                "team":              team,
-                "competition":       TOURNAMENT_LABELS.get(comp_name, comp_name),
-                "year":              year,
-                "round":             rnd,
-                "is_champion":       team_champion.get(team, False),
-                "is_finalist":       rnd == "Final",
-                "is_semifinalist":   rnd in ("Semi-final", "Final"),
-                "is_quarterfinalist": rnd in ("Quarter-final", "Semi-final", "Final"),
-            })
-
-    return pd.DataFrame(records)
+def _winner_of(row: pd.Series) -> str | None:
+    """Vainqueur d'un match jfjelstul (gère les tirs au but)."""
+    if bool(row.get("home_team_win", False)):
+        return canonical(row["home_team_name"])
+    if bool(row.get("away_team_win", False)):
+        return canonical(row["away_team_name"])
+    # Égalité réglée aux pénos
+    hp = row.get("home_team_score_penalties", 0) or 0
+    ap = row.get("away_team_score_penalties", 0) or 0
+    if hp > ap:
+        return canonical(row["home_team_name"])
+    if ap > hp:
+        return canonical(row["away_team_name"])
+    return None
 
 
 def build_competition_history(force: bool = False) -> pd.DataFrame:
     """
-    Construit l'historique complet des grandes compétitions.
-
-    Returns
-    -------
-    pd.DataFrame avec une ligne par (team, competition, year)
+    Construit le palmarès WC détaillé (une ligne par équipe/édition).
+    Colonnes : team, year, round, is_champion, is_finalist, is_semifinalist
     """
     if OUTPUT.exists() and not force:
         return pd.read_csv(OUTPUT)
 
-    results = fetch_results()
-    frames  = []
+    try:
+        r = requests.get(JFJELSTUL_URL, headers=UA, timeout=30)
+        r.raise_for_status()
+        wc = pd.read_csv(io.StringIO(r.text))
+    except Exception as e:
+        print(f"  Historique WC indisponible ({e})")
+        empty = pd.DataFrame(columns=["team", "year", "round",
+                                      "is_champion", "is_finalist", "is_semifinalist"])
+        empty.to_csv(OUTPUT, index=False)
+        return empty
 
-    for comp in MAJOR_TOURNAMENTS:
-        mask = results["tournament"].str.contains(comp, na=False, case=False)
-        df_comp = results[mask]
-        if df_comp.empty:
-            continue
-        print(f"  Traitement : {comp} ({len(df_comp)} matchs)")
-        frames.append(_process_competition(df_comp, comp))
+    wc = wc[wc["tournament_id"].str.match(r"WC-\d{4}$")].copy()
+    wc = wc[~wc["tournament_name"].str.contains("Women", na=False, case=False)]
+    wc["year"]  = wc["tournament_id"].str.extract(r"WC-(\d{4})").astype(int)
+    wc["stage"] = wc["stage_name"].str.lower().str.strip()
 
-    history = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    history.to_csv(OUTPUT, index=False)
-    print(f"Historique compétitions sauvegardé : {len(history)} lignes → {OUTPUT}")
-    return history
+    records = []
+    for year, ed in wc.groupby("year"):
+        teams = set(ed["home_team_name"].map(canonical)) | set(ed["away_team_name"].map(canonical))
+        best = {t: 0 for t in teams}
+        for _, row in ed.iterrows():
+            lvl = _STAGE_ORDER.get(row["stage"], 0)
+            for t in (canonical(row["home_team_name"]), canonical(row["away_team_name"])):
+                best[t] = max(best[t], lvl)
+
+        # Champion = vainqueur de la finale
+        finals = ed[ed["stage"] == "final"]
+        champion = _winner_of(finals.iloc[-1]) if not finals.empty else None
+
+        for t in teams:
+            records.append({
+                "team":            t,
+                "year":            int(year),
+                "round":           best[t],
+                "is_champion":     (t == champion),
+                "is_finalist":     best[t] >= 4,
+                "is_semifinalist": best[t] >= 3,
+            })
+
+    hist = pd.DataFrame(records)
+    hist.to_csv(OUTPUT, index=False)
+    n_champs = hist["is_champion"].sum()
+    print(f"Palmares WC sauvegarde : {len(hist)} lignes, {n_champs} titres -> {OUTPUT}")
+    return hist
 
 
-def team_summary(team: str,
-                 history: pd.DataFrame | None = None) -> dict:
-    """
-    Retourne un résumé de palmarès pour une équipe.
-
-    Exemple de retour :
-    {
-      "World Cup titles": 2,
-      "World Cup finals": 3,
-      "Euro titles": 1,
-      ...
-    }
-    """
+def team_summary(team: str, history: pd.DataFrame | None = None) -> dict:
+    """Résumé de palmarès pour une équipe (clés attendues par predict.py)."""
     if history is None:
         history = build_competition_history()
-
+    team = canonical(team)
     df = history[history["team"] == team]
-    summary: dict = {}
-    for comp in df["competition"].unique():
-        dc = df[df["competition"] == comp]
-        summary[f"{comp} titles"]      = int(dc["is_champion"].sum())
-        summary[f"{comp} finals"]      = int(dc["is_finalist"].sum())
-        summary[f"{comp} semi-finals"] = int(dc["is_semifinalist"].sum())
-    return summary
+    return {
+        "World Cup titles":      int(df["is_champion"].sum()) if not df.empty else 0,
+        "World Cup finals":      int(df["is_finalist"].sum()) if not df.empty else 0,
+        "World Cup semi-finals": int(df["is_semifinalist"].sum()) if not df.empty else 0,
+        "Euro titles":           EURO_TITLES.get(team, 0),
+        "Copa America titles":   COPA_TITLES.get(team, 0),
+    }
 
 
 def top_nations_by_wc_titles(n: int = 10,
-                              history: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Classement des nations par nombre de titres mondiaux."""
+                             history: pd.DataFrame | None = None) -> pd.DataFrame:
     if history is None:
         history = build_competition_history()
-    wc = history[history["competition"] == "World Cup"]
-    return (
-        wc.groupby("team")["is_champion"]
-        .sum()
-        .astype(int)
-        .nlargest(n)
-        .reset_index(name="wc_titles")
-    )
+    return (history.groupby("team")["is_champion"].sum().astype(int)
+            .nlargest(n).reset_index(name="wc_titles"))
 
 
 if __name__ == "__main__":
     hist = build_competition_history(force=True)
-    print(top_nations_by_wc_titles(history=hist))
-    print(team_summary("France", history=hist))
+    print(top_nations_by_wc_titles(history=hist).to_string(index=False))
+    print()
+    for t in ["Brazil", "Germany", "Argentina", "France", "Italy", "Spain"]:
+        print(t, team_summary(t, hist))
