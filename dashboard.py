@@ -52,32 +52,39 @@ def _outcome(h, a):
     return "1" if h > a else ("N" if h == a else "2")
 
 
+def _is_graded(r) -> bool:
+    """Match joué ET pronostic GELÉ avant le coup d'envoi (sinon non évaluable)."""
+    if pd.isna(r["home_real"]):
+        return False
+    if "graded" in r and not bool(r["graded"]):
+        return False
+    return not (pd.isna(r["p_home_win"]) or pd.isna(r["p_draw"]) or pd.isna(r["p_away_win"]))
+
+
 def _compute_bilan(m: pd.DataFrame):
-    """Taux de bons vainqueurs + Brier sur les matchs joués."""
-    played = m[m["home_real"].notna()].copy() if not m.empty else pd.DataFrame()
-    if played.empty:
-        return {"n": 0, "acc": None, "brier": None, "exact": None}
+    """Taux de bons vainqueurs + Brier UNIQUEMENT sur les pronostics gelés pré-match."""
+    if m.empty:
+        return {"n": 0, "n_played": 0, "acc": None, "brier": None, "exact": None,
+                "graded": pd.DataFrame()}
+    n_played = int(m["home_real"].notna().sum())
+    graded_rows = m[m.apply(_is_graded, axis=1)].copy()
+    if graded_rows.empty:
+        return {"n": 0, "n_played": n_played, "acc": None, "brier": None,
+                "exact": None, "graded": graded_rows}
     correct = exact = 0
     brier_sum = 0.0
-    graded = 0
-    for _, r in played.iterrows():
-        if pd.isna(r["p_home_win"]) or pd.isna(r["p_draw"]) or pd.isna(r["p_away_win"]):
-            continue   # pronostic non disponible pour ce match -> non noté
-        graded += 1
+    for _, r in graded_rows.iterrows():
         probs = {"1": float(r["p_home_win"]), "N": float(r["p_draw"]), "2": float(r["p_away_win"])}
         pred = max(probs, key=probs.get)
         real = _outcome(r["home_real"], r["away_real"])
         correct += (pred == real)
-        # score exact
         ph, pa = (int(x) for x in str(r["pred_score"]).split("-"))
         exact += (ph == r["home_real"] and pa == r["away_real"])
         oneh = {"1": 0, "N": 0, "2": 0}; oneh[real] = 1
         brier_sum += sum((probs[k] - oneh[k]) ** 2 for k in probs)
-    if graded == 0:
-        return {"n": len(played), "acc": None, "brier": None, "exact": None,
-                "played": played}
-    return {"n": graded, "acc": correct / graded, "brier": brier_sum / graded,
-            "exact": exact / graded, "played": played}
+    n = len(graded_rows)
+    return {"n": n, "n_played": n_played, "acc": correct / n,
+            "brier": brier_sum / n, "exact": exact / n, "graded": graded_rows}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,10 +108,14 @@ def _match_card(r):
     played = pd.notna(r["home_real"])
 
     if played:
+        graded = _is_graded(r)
         real = _outcome(r["home_real"], r["away_real"])
-        ok = (pred == real)
-        badge = (f'<span class="badge {"ok" if ok else "ko"}">'
-                 f'{"✓" if ok else "✗"}</span>')
+        if graded:
+            ok = (pred == real)
+            badge = (f'<span class="badge {"ok" if ok else "ko"}">'
+                     f'{"✓" if ok else "✗"}</span>')
+        else:
+            badge = '<span class="badge soon">non évalué</span>'
         score = (f'<div class="score real">{int(r["home_real"])}–{int(r["away_real"])}'
                  f'<span class="slab">réel</span></div>')
         state = "played"
@@ -136,28 +147,26 @@ def generate_dashboard() -> str:
     bilan = _compute_bilan(m)
     now = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # ── KPIs ──
+    # ── KPIs ── (uniquement sur les pronostics GELÉS avant match)
     if bilan["n"]:
         kpis = [
-            ("Matchs joués", f'{bilan["n"]}'),
+            ("Matchs évalués", f'{bilan["n"]}'),
             ("Bons vainqueurs", f'{bilan["acc"]*100:.0f}%'),
             ("Score de Brier", f'{bilan["brier"]:.3f}'),
             ("Scores exacts", f'{bilan["exact"]*100:.0f}%'),
         ]
     else:
-        kpis = [("Matchs joués", "0"), ("Bons vainqueurs", "—"),
+        kpis = [("Matchs évalués", "0"), ("Bons vainqueurs", "—"),
                 ("Score de Brier", "—"), ("Scores exacts", "—")]
     kpi_html = "".join(
         f'<div class="kpi"><div class="kv">{v}</div><div class="kl">{html.escape(l)}</div></div>'
         for l, v in kpis)
 
-    # ── Bilan détaillé des matchs joués ──
+    # ── Bilan détaillé (matchs avec pronostic gelé pré-match) ──
     played_html = ""
     if bilan["n"]:
         rows = []
-        for _, r in bilan["played"].iterrows():
-            if pd.isna(r["p_home_win"]) or pd.isna(r["p_draw"]) or pd.isna(r["p_away_win"]):
-                continue
+        for _, r in bilan["graded"].iterrows():
             probs = {"1": float(r["p_home_win"]), "N": float(r["p_draw"]), "2": float(r["p_away_win"])}
             pred = max(probs, key=probs.get)
             real = _outcome(r["home_real"], r["away_real"])
@@ -169,10 +178,14 @@ def generate_dashboard() -> str:
                 f'<td class="c">{html.escape(str(pick))} ({max(probs.values())*100:.0f}%)</td>'
                 f'<td class="c"><b>{int(r["home_real"])}–{int(r["away_real"])}</b></td>'
                 f'<td class="c">{"✓" if ok else "✗"}</td></tr>')
+        ungraded = bilan["n_played"] - bilan["n"]
+        note_ung = (f' {ungraded} match(s) joué(s) ne sont pas évalués : leur pronostic '
+                    f'n\'avait pas été figé avant le coup d\'envoi (déploiement en cours '
+                    f'de tournoi).' if ungraded > 0 else "")
         played_html = (
-            '<p class="legend">✓ = <b>vainqueur</b> correctement prédit. Le score exact '
-            '(souvent « 1-1 » indicatif) n\'entre PAS dans ce jugement : il est ~10% '
-            'prévisible pour n\'importe quel modèle.</p>'
+            '<p class="legend">✓ = <b>vainqueur</b> correctement prédit, sur le pronostic '
+            'FIGÉ AVANT le match (jamais recalculé après coup). Le score exact n\'entre '
+            'PAS dans ce jugement (~10% prévisible).' + note_ung + '</p>'
             '<table class="tbl"><thead><tr><th>Match</th><th>Pronostic (vainqueur)</th>'
             '<th>Score réel</th><th>Bon&nbsp;?</th></tr></thead><tbody>'
             + "".join(rows) + "</tbody></table>")

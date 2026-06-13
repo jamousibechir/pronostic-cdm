@@ -16,6 +16,11 @@ OUTPUTS_DIR = ROOT_DIR / "outputs"
 DATA_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
+# Journal des pronostics GELÉS avant match (suivi/versionné, PAS dans .gitignore).
+# Indispensable pour une notation honnête : on ne note que le pronostic figé
+# AVANT le coup d'envoi, jamais un recalcul post-match (qui aurait vu le résultat).
+PREDICTIONS_LOG = ROOT_DIR / "predictions_log.csv"
+
 # ── Clés API ──────────────────────────────────────────────────────────────────
 # Peut être surchargée via variable d'environnement FOOTBALL_DATA_API_KEY
 FOOTBALL_DATA_API_KEY = os.getenv(

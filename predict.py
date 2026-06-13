@@ -28,7 +28,7 @@ if hasattr(sys.stderr, "reconfigure"):
 from config import (
     SEED, N_SIMULATIONS, OUTPUTS_DIR, DATA_DIR,
     TRAIN_CUTOFF_YEARS, RIDGE_TEAM, RIDGE_CONF, N_BOOTSTRAP,
-    BOOTSTRAP_BLOCK, HOST_TEAMS,
+    BOOTSTRAP_BLOCK, HOST_TEAMS, PREDICTIONS_LOG,
 )
 from ingestion.elo_fetch        import fetch_elo
 from ingestion.fifa_ranking     import fetch_fifa_rankings
@@ -70,16 +70,37 @@ def parse_args():
 # Livrable 1 : scores prédits par match
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _load_pred_log() -> dict:
+    """Journal des pronostics gelés, indexé par match_id."""
+    if PREDICTIONS_LOG.exists():
+        df = pd.read_csv(PREDICTIONS_LOG)
+        return {int(r["match_id"]): dict(r) for _, r in df.iterrows()
+                if pd.notna(r.get("match_id"))}
+    return {}
+
+
+def _save_pred_log(log: dict) -> None:
+    if log:
+        pd.DataFrame(list(log.values())).sort_values("match_id").to_csv(
+            PREDICTIONS_LOG, index=False)
+
+
 def generate_match_predictions(fixtures: pd.DataFrame,
                                  params: dict,
                                  history: pd.DataFrame | None = None,
                                  calibrator=None) -> pd.DataFrame:
     """
-    Génère le CSV matchs.csv avec pour chaque match :
-      score prédit (le plus probable) + P(1)/P(N)/P(2) + buts attendus
-    Les matchs déjà joués ont leurs vrais scores figés.
-    Les probabilités 1/N/2 sont calibrées (isotonique) si un calibrateur est fourni.
+    Génère matchs.csv avec GEL des pronostics avant match (anti look-ahead).
+
+    Pour chaque match :
+      - À VENIR : on (ré)écrit le pronostic candidat dans le journal gelé.
+      - JOUÉ : on affiche/évalue le pronostic GELÉ (celui d'avant le coup d'envoi),
+        jamais un recalcul avec le modèle actuel (qui a déjà vu le résultat).
+        Si aucun pronostic n'avait été figé à temps -> 'graded=False' (non évaluable).
+    Seuls les matchs 'graded=True' entrent dans le bilan.
     """
+    log = _load_pred_log()
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for _, row in fixtures.iterrows():
         home  = str(row["home_team"]) if pd.notna(row["home_team"]) else None
@@ -87,42 +108,60 @@ def generate_match_predictions(fixtures: pd.DataFrame,
         if not home or not away or home == "None" or away == "None":
             continue
 
-        status = str(row.get("status", "SCHEDULED"))
         stage  = str(row.get("stage", ""))
         grp    = str(row.get("group", ""))
+        mid    = int(row["match_id"]) if pd.notna(row.get("match_id")) else None
         has_score = pd.notna(row.get("home_score")) and pd.notna(row.get("away_score"))
-
-        # On prédit TOUJOURS (probabilités + score indicatif), même pour un match
-        # déjà joué : c'est indispensable pour noter le modèle a posteriori (bilan).
-        # Le score réel est ajouté en plus quand il existe.
-        pred = predict_match(home, away, params, neutral=True, host_teams=HOST_TEAMS)
-        p_hw, p_d, p_aw = pred["prob_home_win"], pred["prob_draw"], pred["prob_away_win"]
-        if calibrator is not None:
-            p_hw, p_d, p_aw = calibrator.transform_one(p_hw, p_d, p_aw)
-
         actual = (f"{int(row['home_score'])}-{int(row['away_score'])}"
                   if has_score else None)
 
+        # Pronostic du modèle COURANT (sert pour les matchs à venir, ou l'affichage
+        # des matchs joués non gelés ; JAMAIS pour noter un match joué).
+        pred = predict_match(home, away, params, neutral=True, host_teams=HOST_TEAMS)
+        cur_p1, cur_pn, cur_p2 = pred["prob_home_win"], pred["prob_draw"], pred["prob_away_win"]
+        if calibrator is not None:
+            cur_p1, cur_pn, cur_p2 = calibrator.transform_one(cur_p1, cur_pn, cur_p2)
+        cur_score = f"{pred['most_likely_score'][0]}-{pred['most_likely_score'][1]}"
+
+        if not has_score:
+            # Match à venir : (re)gèle le pronostic candidat
+            if mid is not None:
+                prev_seen = log.get(mid, {}).get("first_seen") if mid in log else None
+                log[mid] = {"match_id": mid, "home_team": home, "away_team": away,
+                            "date": str(row.get("utc_date", "")),
+                            "pred_score": cur_score,
+                            "p_home_win": round(cur_p1, 4), "p_draw": round(cur_pn, 4),
+                            "p_away_win": round(cur_p2, 4),
+                            "first_seen": prev_seen or now, "updated": now}
+            d_score, d1, dn, d2 = cur_score, cur_p1, cur_pn, cur_p2
+            graded, st = False, "PREDICTED"
+        elif mid is not None and mid in log:
+            # Match joué AVEC pronostic gelé pré-match -> évaluable
+            fz = log[mid]
+            d_score = str(fz["pred_score"])
+            d1, dn, d2 = float(fz["p_home_win"]), float(fz["p_draw"]), float(fz["p_away_win"])
+            graded, st = True, "FINISHED"
+        else:
+            # Match joué SANS pronostic figé à temps (déployé après) -> non évaluable
+            d_score, d1, dn, d2 = cur_score, cur_p1, cur_pn, cur_p2
+            graded, st = False, "FINISHED_UNGRADED"
+
         rows.append({
-            "stage":        stage,
-            "group":        grp,
-            "date":         row.get("utc_date", ""),
-            "home_team":    home,
-            "away_team":    away,
-            "pred_score":   f"{pred['most_likely_score'][0]}-{pred['most_likely_score'][1]}",
-            "actual_score": actual,
-            "p_home_win":   round(p_hw, 4),
-            "p_draw":       round(p_d,  4),
-            "p_away_win":   round(p_aw, 4),
-            "exp_home":     round(pred["expected_home"], 3),
-            "exp_away":     round(pred["expected_away"], 3),
-            "status":       "FINISHED" if has_score else "PREDICTED",
+            "stage": stage, "group": grp, "date": row.get("utc_date", ""),
+            "home_team": home, "away_team": away,
+            "pred_score": d_score, "actual_score": actual,
+            "p_home_win": round(d1, 4), "p_draw": round(dn, 4), "p_away_win": round(d2, 4),
+            "exp_home": round(pred["expected_home"], 3),
+            "exp_away": round(pred["expected_away"], 3),
+            "graded": graded, "status": st,
         })
 
+    _save_pred_log(log)
     df = pd.DataFrame(rows)
     out = OUTPUTS_DIR / "matchs.csv"
     df.to_csv(out, index=False)
-    print(f"Livrable 1 -> {out}  ({len(df)} matchs)")
+    n_frozen = sum(r["graded"] for r in rows)
+    print(f"Livrable 1 -> {out}  ({len(df)} matchs, {n_frozen} evalues sur pronostic gele)")
     return df
 
 
