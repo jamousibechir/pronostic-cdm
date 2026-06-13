@@ -1,0 +1,58 @@
+name: Pronostic CdM 2026 - daily
+
+# Tourne chaque jour a 06:00 UTC = 08:00 Paris (heure d'ete CEST).
+# (En hiver ce serait 07:00 Paris ; la CdM se joue en ete donc 08:00 est correct.)
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}      # bouton "Run workflow" pour declencher a la main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dependances
+        run: pip install -r requirements.txt
+
+      - name: Recalculer les predictions + dashboard
+        env:
+          # La cle a un repli code en dur dans config.py ; ce secret est
+          # optionnel (si tu en ajoutes un un jour, il sera utilise).
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '483b2f1dd70c49b3b0b22335fb46937f' }}
+        run: python predict.py --force --n-sims 10000
+
+      - name: Preparer le site (dashboard + CSV)
+        run: |
+          mkdir -p _site
+          cp outputs/dashboard.html _site/index.html
+          cp outputs/*.csv _site/ || true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
