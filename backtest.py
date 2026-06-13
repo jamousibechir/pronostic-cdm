@@ -16,7 +16,7 @@ Métriques : Brier, log-loss, accuracy 1/N/2, RMSE buts, courbe de calibration.
 import numpy as np
 import pandas as pd
 
-from config import OUTPUTS_DIR, RIDGE_TEAM, RIDGE_CONF
+from config import OUTPUTS_DIR, RIDGE_TEAM, RIDGE_CONF, HALF_LIFE_DAYS
 from ingestion.results_fetch import fetch_results
 from ingestion.elo_fetch import fetch_elo
 from ingestion.confederations import confederation_map
@@ -28,7 +28,8 @@ TRAIN_END   = "2024-09-30"
 TEST_START  = "2024-10-01"
 TEST_END    = "2026-05-31"
 TRAIN_YEARS = 10
-# Grille log-restreinte 2-D : (shrinkage équipe->confédération, confédération->global)
+# Grilles de réglage : demi-vie temporelle + shrinkage équipe
+HALF_LIFE_GRID  = [365, 547, 730, 1095]   # 1 an, 18 mois, 2 ans, 3 ans
 RIDGE_TEAM_GRID = [0.5, 2.0, 8.0]
 RIDGE_CONF_GRID = [0.1, 1.0, 10.0]
 BACKTEST_OUT = OUTPUTS_DIR / "backtest_metrics.csv"
@@ -66,43 +67,34 @@ def _predict_set(matches, params):
             np.array(xh), np.array(xa), np.array(ah), np.array(aa))
 
 
-def _tune_ridges(train, elo_dict, conf_map, verbose=True):
+def _tune_hyperparams(train, elo_dict, conf_map, verbose=True):
     """
-    Règle ridge_team par validation temporelle. ridge_conf est FIXÉ (config) :
-    la validation est dominée par l'intra-confédération, où le niveau de
-    confédération s'annule dans (r_i − r_j) ; elle ne peut donc pas le régler.
-    On imprime quand même la sensibilité à ridge_conf pour transparence.
+    Règle conjointement (demi-vie, ridge_team) par validation temporelle.
+    ridge_conf est FIXÉ (config) : la validation est dominée par l'intra-
+    confédération, où le niveau de confédération s'annule dans (r_i − r_j) ;
+    elle ne peut donc pas le régler (validé par le backtest de tournoi).
     """
     train = train.sort_values("date")
     cutoff = train["date"].max() - pd.DateOffset(months=18)
     sub_tr = train[train["date"] <= cutoff]
     sub_va = train[train["date"] > cutoff]
     if len(sub_va) < 100 or len(sub_tr) < 500:
-        return RIDGE_TEAM, RIDGE_CONF
+        return HALF_LIFE_DAYS, RIDGE_TEAM, RIDGE_CONF
 
-    best_rt, best_ll = RIDGE_TEAM, np.inf
-    for rt in RIDGE_TEAM_GRID:
-        p = estimate_strengths(sub_tr, ref_date=cutoff, ridge_team=rt,
-                               ridge_conf=RIDGE_CONF, elo_dict=elo_dict,
-                               conf_map=conf_map, verbose=False)
-        probs, outs, *_ = _predict_set(sub_va, p)
-        ll = log_loss(probs, outs)
-        if verbose:
-            print(f"    ridge_team={rt:4.1f} (ridge_conf={RIDGE_CONF}) -> val log-loss={ll:.4f}")
-        if ll < best_ll:
-            best_ll, best_rt = ll, rt
-
-    # Sensibilité (informative) à ridge_conf, au meilleur ridge_team
-    if verbose:
-        for rc in RIDGE_CONF_GRID:
-            p = estimate_strengths(sub_tr, ref_date=cutoff, ridge_team=best_rt,
-                                   ridge_conf=rc, elo_dict=elo_dict,
-                                   conf_map=conf_map, verbose=False)
+    best, best_ll = (HALF_LIFE_DAYS, RIDGE_TEAM), np.inf
+    for hl in HALF_LIFE_GRID:
+        for rt in RIDGE_TEAM_GRID:
+            p = estimate_strengths(sub_tr, ref_date=cutoff, ridge_team=rt,
+                                   ridge_conf=RIDGE_CONF, elo_dict=elo_dict,
+                                   conf_map=conf_map, half_life=hl, verbose=False)
             probs, outs, *_ = _predict_set(sub_va, p)
-            print(f"    [info] ridge_conf={rc:5.1f} -> val log-loss={log_loss(probs, outs):.4f} "
-                  f"(quasi insensible -> fixe a {RIDGE_CONF} par prior)")
-    print(f"  Retenu : ridge_team={best_rt}  ridge_conf={RIDGE_CONF} (prior)")
-    return best_rt, RIDGE_CONF
+            ll = log_loss(probs, outs)
+            if verbose:
+                print(f"    half_life={hl:4d} ridge_team={rt:4.1f} -> val log-loss={ll:.4f}")
+            if ll < best_ll:
+                best_ll, best = ll, (hl, rt)
+    print(f"  Retenus : half_life={best[0]}  ridge_team={best[1]}  ridge_conf={RIDGE_CONF}")
+    return best[0], best[1], RIDGE_CONF
 
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
@@ -123,9 +115,9 @@ def run_backtest(verbose: bool = True) -> pd.DataFrame:
     print(f"  Entrainement : {len(train)} matchs ({train_start.date()} -> {TRAIN_END})")
     print(f"  Test         : {len(test)} matchs ({TEST_START} -> {TEST_END})")
 
-    # ── Réglage des deux ridges sur validation interne ──
-    print("\nReglage du shrinkage (2 niveaux) sur validation temporelle...")
-    ridge_team, ridge_conf = _tune_ridges(train, elo_dict, conf_map, verbose=verbose)
+    # ── Réglage des hyperparamètres sur validation interne ──
+    print("\nReglage (demi-vie + shrinkage) sur validation temporelle...")
+    half_life, ridge_team, ridge_conf = _tune_hyperparams(train, elo_dict, conf_map, verbose=verbose)
 
     # ── Modèle final + calibrateur (tous deux sans toucher au test) ──
     print("\nEstimation du modele final...")
@@ -134,7 +126,8 @@ def run_backtest(verbose: bool = True) -> pd.DataFrame:
     # rechargerait un modèle entraîné seulement jusqu'à TRAIN_END.
     ref_date = pd.Timestamp(TRAIN_END)
     params = estimate_strengths(train, ref_date=ref_date, ridge_team=ridge_team,
-                                ridge_conf=ridge_conf, elo_dict=elo_dict, conf_map=conf_map)
+                                ridge_conf=ridge_conf, elo_dict=elo_dict,
+                                conf_map=conf_map, half_life=half_life)
     print(f"  beta0={params['beta0']:.3f}  home_adv={params['home_adv']:.3f}  "
           f"rho={params['rho']:.4f}  ({len(params['teams'])} equipes)")
 
@@ -146,7 +139,7 @@ def run_backtest(verbose: bool = True) -> pd.DataFrame:
     if len(cal_va) >= 100 and len(cal_tr) >= 500:
         cal_params = estimate_strengths(cal_tr, ref_date=cal_cut, ridge_team=ridge_team,
                                         ridge_conf=ridge_conf, elo_dict=elo_dict,
-                                        conf_map=conf_map, verbose=False)
+                                        conf_map=conf_map, half_life=half_life, verbose=False)
         cp, co, *_ = _predict_set(cal_va, cal_params)
         cal.fit(cp, co)
 
@@ -172,7 +165,7 @@ def run_backtest(verbose: bool = True) -> pd.DataFrame:
     cal_err_raw, cal_err_cal = _calibration_report(probs, probs_cal, outs)
 
     metrics = pd.DataFrame([{
-        "ridge_team": ridge_team, "ridge_conf": ridge_conf,
+        "half_life": half_life, "ridge_team": ridge_team, "ridge_conf": ridge_conf,
         "brier_raw": bs_r, "logloss_raw": ll_r, "acc_raw": acc_r,
         "brier_cal": bs_c, "logloss_cal": ll_c, "acc_cal": acc_c,
         "rmse_home": rmse_h, "rmse_away": rmse_a,
