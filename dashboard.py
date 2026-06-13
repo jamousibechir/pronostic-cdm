@@ -214,8 +214,23 @@ def generate_dashboard() -> str:
         filt += f'<button class="f" data-f="g{g}">{g}</button>'
     cards = "".join(_match_card(r) for _, r in m.iterrows()) if not m.empty else "<p>Aucun match.</p>"
 
+    # ── Bannière "gagnant le plus probable" ──
+    champ_banner = ""
+    if not champ.empty and "win_pct" in champ.columns:
+        top3 = champ.head(3)
+        fav = top3.iloc[0]
+        others = " · ".join(f'{html.escape(str(r["team"]))} {r["win_pct"]}'
+                            for _, r in top3.iloc[1:].iterrows())
+        champ_banner = (
+            '<div class="hero">'
+            '<div class="hero-l">🏆 Gagnant le plus probable</div>'
+            f'<div class="hero-team">{html.escape(str(fav["team"]))}</div>'
+            f'<div class="hero-pct">{fav["win_pct"]}</div>'
+            f'<div class="hero-others">puis {others}</div>'
+            '</div>')
+
     return _TEMPLATE.format(
-        now=now, kpis=kpi_html,
+        now=now, kpis=kpi_html, champ_banner=champ_banner,
         played_section=(f'<section class="card"><h2>Bilan des matchs joués</h2>{played_html}</section>'
                         if played_html else ""),
         champ=champ_html or "<p>Lance predict.py d'abord.</p>",
@@ -278,12 +293,21 @@ padding:5px 11px;font-size:13px;cursor:pointer}}
 .tbl tr.ok td:last-child{{color:var(--ok)}}.tbl tr.ko td:last-child{{color:var(--ko)}}
 .legend{{font-size:12px;color:var(--mut);margin-top:8px}}
 .legend b.s1{{color:var(--s1)}}.legend b.sn{{color:var(--sn)}}.legend b.s2{{color:var(--s2)}}
+.hero{{background:linear-gradient(135deg,#1e2742,#171a21);border:1px solid var(--s1);
+border-radius:14px;padding:18px 22px;margin-bottom:16px;display:flex;align-items:baseline;
+gap:16px;flex-wrap:wrap}}
+.hero-l{{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:1px}}
+.hero-team{{font-size:30px;font-weight:800;color:#fff}}
+.hero-pct{{font-size:30px;font-weight:800;color:var(--s1)}}
+.hero-others{{font-size:13px;color:var(--mut);margin-left:auto}}
 @media(max-width:820px){{.grid{{grid-template-columns:1fr}}.kpis{{grid-template-columns:repeat(2,1fr)}}}}
 </style></head><body><div class="wrap">
 <header>
   <div><h1>⚽ Pronostic Coupe du Monde 2026</h1>
   <div class="sub">Tableau de bord — mis à jour le {now}</div></div>
 </header>
+
+{champ_banner}
 
 <div class="kpis">{kpis}</div>
 
