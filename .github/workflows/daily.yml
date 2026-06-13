@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}      # bouton "Run workflow" pour declencher a la main
 
 permissions:
-  contents: read
+  contents: write     # pour committer predictions_log.csv (pronostics geles)
   pages: write
   id-token: write
 
@@ -36,6 +36,14 @@ jobs:
           # optionnel (si tu en ajoutes un un jour, il sera utilise).
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '483b2f1dd70c49b3b0b22335fb46937f' }}
         run: python predict.py --force --n-sims 10000
+
+      - name: Persister le journal des pronostics geles
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add predictions_log.csv
+          git diff --cached --quiet || git commit -m "chore: journal des pronostics geles (run quotidien) [skip ci]"
+          git push
 
       - name: Preparer le site (dashboard + CSV)
         run: |
